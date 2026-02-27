@@ -14,19 +14,31 @@
  *   - Conversations complete when all branches resolve (no more pending mentions)
  */
 
+import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { MessageData, ResponseData, QueueFile, ChainStep, Conversation, TeamConfig } from './lib/types';
 import {
     QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_PROCESSING,
     LOG_FILE, EVENTS_DIR, CHATS_DIR, FILES_DIR,
-    getSettings, getAgents, getTeams
+    TINYCLAW_HOME, getSettings, getAgents, getTeams
 } from './lib/config';
 import { log, emitEvent } from './lib/logging';
 import { parseAgentRouting, findTeamForAgent, getAgentResetFlag, extractTeammateMentions } from './lib/routing';
 import { invokeAgent } from './lib/invoke';
-import { loadPlugins, runIncomingHooks, runOutgoingHooks, HookMetadata } from './lib/plugins';
 import { jsonrepair } from 'jsonrepair';
+import {
+    loadPlugins,
+    runIncomingHooks,
+    runOutgoingHooks,
+    runBeforeModelHooks,
+    runAfterModelHooks,
+    runSessionResetHooks,
+    runStartupHooks,
+    runHealthHooks,
+    runSessionEndHooks,
+} from './lib/plugins';
+import { ensureAgentDirectory } from './lib/agent-setup';
 
 /** Parse JSON with automatic repair for malformed content (e.g. bad escapes). */
 function safeParseJSON<T = unknown>(raw: string, label?: string): T {
@@ -45,6 +57,86 @@ function safeParseJSON<T = unknown>(raw: string, label?: string): T {
     }
 });
 
+const RUNTIME_DIR = path.join(TINYCLAW_HOME, 'runtime');
+const QUEUE_PROCESSOR_LOCK_FILE = path.join(RUNTIME_DIR, 'queue-processor.lock');
+let queueProcessorLockFd: number | null = null;
+
+function isPidRunning(pid: number): boolean {
+    if (!Number.isFinite(pid) || pid <= 0) return false;
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'EPERM';
+    }
+}
+
+function releaseQueueProcessorLock(): void {
+    if (queueProcessorLockFd !== null) {
+        try {
+            fs.closeSync(queueProcessorLockFd);
+        } catch {
+            // Ignore lock fd close errors during shutdown.
+        }
+        queueProcessorLockFd = null;
+    }
+    try {
+        if (fs.existsSync(QUEUE_PROCESSOR_LOCK_FILE)) {
+            fs.unlinkSync(QUEUE_PROCESSOR_LOCK_FILE);
+        }
+    } catch {
+        // Ignore lock file cleanup errors during shutdown.
+    }
+}
+
+function acquireQueueProcessorLock(): boolean {
+    if (!fs.existsSync(RUNTIME_DIR)) {
+        fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+    }
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const fd = fs.openSync(QUEUE_PROCESSOR_LOCK_FILE, 'wx');
+            queueProcessorLockFd = fd;
+            const payload = {
+                pid: process.pid,
+                startedAt: new Date().toISOString(),
+            };
+            fs.writeFileSync(fd, JSON.stringify(payload, null, 2) + '\n', 'utf8');
+            return true;
+        } catch (error) {
+            const err = error as NodeJS.ErrnoException;
+            if (err.code !== 'EEXIST') {
+                log('ERROR', `Failed to acquire queue processor lock: ${err.message}`);
+                return false;
+            }
+
+            try {
+                const raw = fs.readFileSync(QUEUE_PROCESSOR_LOCK_FILE, 'utf8');
+                const lock = JSON.parse(raw) as { pid?: number };
+                const pid = Number(lock?.pid || 0);
+                if (isPidRunning(pid)) {
+                    log('WARN', `Queue processor already running (pid=${pid}), exiting duplicate instance`);
+                    return false;
+                }
+                fs.unlinkSync(QUEUE_PROCESSOR_LOCK_FILE);
+                log('WARN', `Removed stale queue processor lock (pid=${pid || 'unknown'})`);
+            } catch {
+                try {
+                    fs.unlinkSync(QUEUE_PROCESSOR_LOCK_FILE);
+                    log('WARN', 'Removed unreadable queue processor lock file');
+                } catch (unlinkError) {
+                    log('ERROR', `Failed to clear queue processor lock: ${(unlinkError as Error).message}`);
+                    return false;
+                }
+            }
+        }
+    }
+
+    log('ERROR', 'Failed to acquire queue processor lock after stale-lock recovery');
+    return false;
+}
+
 // Files currently queued in a promise chain — prevents duplicate processing across ticks
 const queuedFiles = new Set<string>();
 
@@ -52,6 +144,14 @@ const queuedFiles = new Set<string>();
 const conversations = new Map<string, Conversation>();
 
 const MAX_CONVERSATION_MESSAGES = 50;
+function sanitizeResponseMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+    const allowed: Record<string, unknown> = {};
+    const parseMode = metadata.parseMode;
+    if (parseMode === 'MarkdownV2') {
+        allowed.parseMode = parseMode;
+    }
+    return allowed;
+}
 
 // Clean up orphaned files from processing/ on startup
 function recoverOrphanedFiles() {
@@ -181,6 +281,7 @@ async function completeConversation(conv: Conversation): Promise<void> {
 
     // Run outgoing hooks
     const { text: hookedResponse, metadata } = await runOutgoingHooks(finalResponse, { channel: conv.channel, sender: conv.sender, messageId: conv.messageId, originalMessage: conv.originalMessage });
+    const safeMetadata = sanitizeResponseMetadata(metadata);
 
     // Write to outgoing queue
     const responseData: ResponseData = {
@@ -191,7 +292,7 @@ async function completeConversation(conv: Conversation): Promise<void> {
         timestamp: Date.now(),
         messageId: conv.messageId,
         files: outboundFiles.length > 0 ? outboundFiles : undefined,
-        metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+        metadata: Object.keys(safeMetadata).length > 0 ? safeMetadata : undefined,
     };
 
     const responseFile = conv.channel === 'heartbeat'
@@ -282,6 +383,7 @@ async function processMessage(messageFile: string): Promise<void> {
         }
 
         const agent = agents[agentId];
+        ensureAgentDirectory(path.join(workspacePath, agentId));
         log('INFO', `Routing to agent: ${agent.name} (${agentId}) [${agent.provider}/${agent.model}]`);
         if (!isInternal) {
             emitEvent('agent_routed', { agentId, agentName: agent.name, provider: agent.provider, model: agent.model, isTeamRouted });
@@ -310,9 +412,25 @@ async function processMessage(messageFile: string): Promise<void> {
         // Check for per-agent reset
         const agentResetFlag = getAgentResetFlag(agentId, workspacePath);
         const shouldReset = fs.existsSync(agentResetFlag);
+        const userMessageForSession = message;
+        const modelHookBaseContext = {
+            settings,
+            messageData,
+            channel,
+            sender,
+            messageId,
+            originalMessage: rawMessage,
+            agentId,
+            agent,
+            workspacePath,
+            isInternal,
+            shouldReset,
+            userMessageForSession,
+        };
 
         if (shouldReset) {
             fs.unlinkSync(agentResetFlag);
+            await runSessionResetHooks(modelHookBaseContext);
         }
 
         // For internal messages: append pending response indicator so the agent
@@ -330,6 +448,9 @@ async function processMessage(messageFile: string): Promise<void> {
 
         // Run incoming hooks
         ({ text: message } = await runIncomingHooks(message, { channel, sender, messageId, originalMessage: rawMessage }));
+        const beforeModel = await runBeforeModelHooks(message, modelHookBaseContext);
+        message = beforeModel.message;
+        const modelHookStates = beforeModel.states;
 
         // Invoke agent
         emitEvent('chain_step_start', { agentId, agentName: agent.name, fromAgent: messageData.fromAgent || null });
@@ -344,6 +465,11 @@ async function processMessage(messageFile: string): Promise<void> {
         }
 
         emitEvent('chain_step_done', { agentId, agentName: agent.name, responseLength: response.length, responseText: response });
+        await runAfterModelHooks(
+            response,
+            { ...modelHookBaseContext, message },
+            modelHookStates
+        );
 
         // --- No team context: simple response to user ---
         if (!teamContext) {
@@ -359,6 +485,7 @@ async function processMessage(messageFile: string): Promise<void> {
 
             // Run outgoing hooks
             const { text: hookedResponse, metadata } = await runOutgoingHooks(finalResponse, { channel, sender, messageId, originalMessage: rawMessage });
+            const safeMetadata = sanitizeResponseMetadata(metadata);
 
             const responseData: ResponseData = {
                 channel,
@@ -369,7 +496,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 messageId,
                 agent: agentId,
                 files: outboundFiles.length > 0 ? outboundFiles : undefined,
-                metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+                metadata: Object.keys(safeMetadata).length > 0 ? safeMetadata : undefined,
             };
 
             const responseFile = channel === 'heartbeat'
@@ -574,24 +701,46 @@ if (!fs.existsSync(EVENTS_DIR)) {
 
 // Main loop
 (async () => {
+    if (!acquireQueueProcessorLock()) {
+        process.exit(0);
+    }
     log('INFO', 'Queue processor started');
     recoverOrphanedFiles();
+    const startupSettings = getSettings();
     await loadPlugins();
+    await runStartupHooks({ settings: startupSettings });
+    const pluginHealth = await runHealthHooks({ settings: startupSettings });
+    for (const health of pluginHealth) {
+        log(
+            'INFO',
+            `Plugin health: ${health.plugin} status=${health.result.status} summary=${health.result.summary}`
+        );
+    }
     log('INFO', `Watching: ${QUEUE_INCOMING}`);
     logAgentConfig();
-    emitEvent('processor_start', { agents: Object.keys(getAgents(getSettings())), teams: Object.keys(getTeams(getSettings())) });
+    emitEvent('processor_start', { agents: Object.keys(getAgents(startupSettings)), teams: Object.keys(getTeams(startupSettings)) });
 
     // Process queue every 1 second
     setInterval(processQueue, 1000);
 })();
 
 // Graceful shutdown
-process.on('SIGINT', () => {
-    log('INFO', 'Shutting down queue processor...');
+let isShuttingDown = false;
+async function gracefulShutdown(signal: string): Promise<void> {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    log('INFO', `Shutting down queue processor... (${signal})`);
+    await runSessionEndHooks({
+        settings: getSettings(),
+        reason: 'shutdown',
+        signal,
+    });
+    releaseQueueProcessorLock();
     process.exit(0);
-});
+}
 
-process.on('SIGTERM', () => {
-    log('INFO', 'Shutting down queue processor...');
-    process.exit(0);
+process.on('SIGINT', () => { void gracefulShutdown('SIGINT'); });
+process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
+process.on('exit', () => {
+    releaseQueueProcessorLock();
 });
